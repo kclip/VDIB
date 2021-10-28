@@ -1,10 +1,9 @@
 import torch
-from snn.models.SNN import LayeredSNN
+from snn.models.base import SNNLayer
 import numpy as np
-from utils.activations import smooth_step
+from utils.activations import eprop_sigmoid
 from models.LIF_base import LIFLayer
 from torch import nn
-from utils.activations import trainingHook
 from utils.misc import get_output_shape
 from snn.utils import filters
 
@@ -14,96 +13,13 @@ https://github.com/nmi-lab/decolle-public (code under GPLv3 License)
 https://github.com/ChFrenkel/DirectRandomTargetProjection (code under Apache v2.0 license)
 """
 
-class gaussian_encoder(torch.nn.Module):
-    def __init__(self, input_size, hidden_neurons, n_outputs_enc, device='cpu') -> None:
-        super(gaussian_encoder, self).__init__()
-
-        self.network = LayeredSNN(input_size, hidden_neurons[:-1], hidden_neurons[-1], device=device)
-        self.mean = torch.nn.Linear(hidden_neurons[-1], n_outputs_enc)
-        self.var = torch.nn.Linear(hidden_neurons[-1], n_outputs_enc)
-
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        return mu + eps*std
-
-    def forward(self, inputs, n_samples=1):
-        _, _, probas_hidden, outputs_hidden = self.network(inputs, n_samples=n_samples)
-
-        mu, logvar = self.mean(self.network.out_layer.potential), self.var(self.network.out_layer.potential)
-
-        return self.reparameterize(mu, logvar), mu, logvar, probas_hidden, outputs_hidden
-
-
-class TrainingHook(nn.Module):
-    def __init__(self, dim_hook, mode):
-        super(TrainingHook, self).__init__()
-
-        # Feedback weights definition (FA feedback weights are handled in the FA_wrapper class)
-        self.fixed_fb_weights = nn.Parameter(torch.Tensor(torch.Size(dim_hook)))
-        torch.nn.init.kaiming_uniform_(self.fixed_fb_weights)
-        self.fixed_fb_weights.requires_grad = False
-        self.mode = mode
-
-    def forward(self, input, e):
-        return trainingHook(input, e, self.fixed_fb_weights, self.mode)
-
-    def __repr__(self):
-        return self.__class__.__name__ + ' (' + str(self.fixed_fb_weights.shape) + ')'
-
-
-class FA_wrapper(nn.Module):
-    ''''
-    From https://github.com/ChFrenkel/DirectRandomTargetProjection/
-    '''
-    def __init__(self, module, dim, stride=None, padding=None):
-        super(FA_wrapper, self).__init__()
-        self.module = module
-        self.stride = stride
-        self.padding = padding
-        self.output_grad = None
-        self.x_shape = None
-
-        # FA feedback weights definition
-        self.fixed_fb_weights = nn.Parameter(torch.Tensor(torch.Size(dim)))
-        self.reset_weights()
-
-    def forward(self, x):
-        if x.requires_grad:
-            x.register_hook(self.FA_hook_pre)
-            self.x_shape = x.shape
-            x, u = self.module(x)
-            x.register_hook(self.FA_hook_post)
-            return x, u
-        else:
-            return self.module(x)
-
-    def reset_weights(self):
-        torch.nn.init.kaiming_uniform_(self.fixed_fb_weights)
-        self.fixed_fb_weights.requires_grad = False
-
-    def FA_hook_pre(self, grad):
-        if self.output_grad is not None:
-            if isinstance(self.module.base_layer, torch.nn.Linear):
-                return self.output_grad.mm(self.fixed_fb_weights)
-            elif isinstance(self.module.base_layer, torch.nn.Conv2d):
-                return torch.nn.grad.conv2d_input(self.x_shape, self.fixed_fb_weights, self.output_grad, self.stride, self.padding)
-            else:
-                raise NameError("=== ERROR: layer type " + str(self.self.module.base_layer) + " is not supported in FA wrapper")
-        else:
-            return grad
-
-    def FA_hook_post(self, grad):
-        self.output_grad = grad
-        return grad
-
 
 class DFAEncoder(torch.nn.Module):
     def __init__(self,
                  input_shape,
                  output_shape,
-                 mode='DFA',
+                 batch_size,
+                 mode='eprop',
                  Nhid_conv=[1],
                  Nhid_mlp=[128],
                  kernel_size=[7],
@@ -112,12 +28,13 @@ class DFAEncoder(torch.nn.Module):
                  alpha=[.9],
                  beta=[.85],
                  alpharp=[.65],
-                 tau_d=10,
-                 activation=smooth_step,
+                 tau_e=10,
+                 activation=eprop_sigmoid,
                  num_conv_layers=2,
                  num_mlp_layers=1,
                  lif_layer_type=LIFLayer,
                  with_bias=True,
+                 dropout=[0.],
                  filter=filters.raised_cosine_pillow_08,
                  device='cpu'
                  ):
@@ -144,23 +61,27 @@ class DFAEncoder(torch.nn.Module):
             alpharp = alpharp * self.num_layers
         if len(beta) == 1:
             beta = beta * self.num_layers
+        if len(dropout) == 1:
+            dropout = dropout * self.num_layers
+        self.dropout = dropout
+
 
         super(DFAEncoder, self).__init__()
 
         self.pool_layers = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
         self.input_shape = input_shape
         self.output_shape = output_shape
         self.activation = activation
         self.mode = mode
+        self.tau_e = tau_e
 
-        if (self.mode == 'DFA') or (mode == 'DRTP'):
-            self.e = torch.zeros([1, output_shape], requires_grad=False).to(device)
+        if self.mode == 'eprop':
+            self.e = torch.zeros([batch_size, output_shape], requires_grad=False).to(device)
         else:
             self.e = None
 
         self.LIF_layers = torch.nn.ModuleList()
-        self.hooks = torch.nn.ModuleList()
-
 
         if num_conv_layers > 0:
             # Computing padding to preserve feature size
@@ -178,24 +99,26 @@ class DFAEncoder(torch.nn.Module):
                 stride=stride[i],
                 padding=padding[i],
                 dilation=1)
-            feature_height //= pool_size[i]
-            feature_width //= pool_size[i]
             base_layer = nn.Conv2d(Nhid_conv[i], Nhid_conv[i + 1], kernel_size[i], stride[i], padding[i], bias=with_bias)
 
             layer = lif_layer_type(base_layer,
                                    activation=activation,
                                    alpha=alpha[i],
                                    beta=beta[i],
-                                   alpharp=alpharp[i]
+                                   alpharp=alpharp[i],
+                                   dim_hook=[output_shape, Nhid_conv[i + 1], feature_height, feature_width],
+                                   mode=self.mode
                                    )
             pool = nn.MaxPool2d(kernel_size=pool_size[i])
-
-            if (self.mode == 'DFA') or (mode == 'DRTP'):
-                self.LIF_layers.append(layer)
-            elif self.mode == 'FA':
-                self.LIF_layers.append(FA_wrapper(layer, base_layer.weight.shape, stride=stride[i], padding=padding[i]))
-            self.hooks.append(TrainingHook([output_shape, Nhid_conv[i + 1], feature_height, feature_width], self.mode))
+            self.LIF_layers.append(layer)
+            feature_height //= pool_size[i]
+            feature_width //= pool_size[i]
             self.pool_layers.append(pool)
+            if self.dropout[i] > 0.0:
+                dropout_layer = nn.Dropout(self.dropout[i])
+            else:
+                dropout_layer = nn.Identity()
+            self.dropout_layers.append(dropout_layer)
 
         if num_conv_layers > 0:
             mlp_in = int(feature_height * feature_width * Nhid_conv[-1])
@@ -210,47 +133,55 @@ class DFAEncoder(torch.nn.Module):
                                    activation=activation,
                                    alpha=alpha[i],
                                    beta=beta[i],
-                                   alpharp=alpharp[i]
+                                   alpharp=alpharp[i],
+                                   dim_hook=[output_shape, Nhid_mlp[i + 1]],
+                                   mode=self.mode
                                    )
 
-            if (self.mode == 'DFA') or (mode == 'DRTP'):
-                self.LIF_layers.append(layer)
-            elif self.mode == 'FA':
-                self.LIF_layers.append(FA_wrapper(layer, base_layer.weight.shape))
-            self.hooks.append(TrainingHook([output_shape, Nhid_mlp[i+1]], self.mode))
+            self.LIF_layers.append(layer)
             self.pool_layers.append(nn.Sequential())
-
+            if self.dropout[i] > 0.0:
+                dropout_layer = nn.Dropout(self.dropout[i])
+            else:
+                dropout_layer = nn.Identity()
+            self.dropout_layers.append(dropout_layer)
 
         self.hidden_hist = None
-        self.out_layer = LayeredSNN(Nhid_mlp[-1], [], output_shape, tau_ff=[tau_d], tau_fb=[tau_d], synaptic_filter=filter, device=device)
+        self.out_layer = SNNLayer(Nhid_mlp[-1], output_shape, batch_size, synaptic_filter=filter, n_basis_feedforward=8,
+                                    n_basis_feedback=1, tau_ff=tau_e, tau_fb=tau_e, mu=0.5, device=device)
 
     def forward(self, inputs, targets=None):
         i = 0
-        # Forward propagates the signal through all layers
+        s_out = []
+        if self.num_conv_layers == 0:
+            inputs = inputs.view(inputs.size(0), -1)
 
-        for lif, hook, pool in zip(self.LIF_layers, self.hooks, self.pool_layers):
+        # Forward propagates the signal through all layers
+        for lif, pool, do in zip(self.LIF_layers, self.pool_layers, self.dropout_layers):
+            s, u = lif(inputs, self.e)
+            s_out.append(s)
+            s_p = pool(s)
+            inputs = s_p.detach()
+            i += 1
             if i == self.num_conv_layers:
                 inputs = inputs.view(inputs.size(0), -1)
 
-            _, u = lif(inputs)
-            u_p = pool(u)
-            s_ = self.activation(u_p)
-            s_ = hook(s_, self.e)
-
-            inputs = s_
-            i += 1
-
         if self.hidden_hist is not None:
-            hidden_hist = torch.cat((self.hidden_hist[:, 1-self.out_layer.out_layer.memory_length:], inputs.flatten().unsqueeze(1)), dim=-1)
+            hidden_hist = torch.cat((self.hidden_hist[:, :, 1-self.out_layer.memory_length:], inputs.unsqueeze(2)), dim=-1)
         else:
-            hidden_hist = inputs.flatten().unsqueeze(1)
+            hidden_hist = inputs.unsqueeze(2)
 
-        net_probas, net_outputs, _, _ = self.out_layer(hidden_hist, targets, n_samples=1)
+        net_probas, net_outputs = self.out_layer(hidden_hist, targets)
+        s_out.append(net_probas.unsqueeze(1))
 
-        if self.mode == 'DFA':
-            self.e.data.copy_(net_outputs.data - net_probas.data)
-        elif self.mode == 'DRTP':
-            self.e.data.copy_(net_outputs.data)
+        self.e.data.copy_(net_outputs.data.detach() - net_probas.data.detach())
+        self.hidden_hist = hidden_hist
 
-        self.hidden_hist = hidden_hist.detach()
-        return net_outputs.detach(), net_probas
+        return net_outputs.detach().unsqueeze(1), s_out
+
+
+    def detach_(self):
+        for l in self.LIF_layers:
+            l.detach_()
+        self.hidden_hist.detach_()
+        self.out_layer.detach_()

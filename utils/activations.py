@@ -35,6 +35,39 @@ class SigmoidStep(torch.autograd.Function):
         return res*(1-res)*grad_output
 
 
+class EpropSigmoidStep(torch.autograd.Function):
+    @staticmethod
+    def forward(aux, x, e, fixed_fb_weights, mode):
+        aux.save_for_backward(x, e, fixed_fb_weights)
+        aux.in1 = mode
+
+        return (x >= 0).type(x.dtype)
+
+    def backward(aux, grad_output):
+        input, e, fixed_fb_weights = aux.saved_tensors
+        mode = aux.in1
+
+        res = torch.sigmoid(input)
+
+        if mode == 'eprop':
+            grad_output = e.mm(fixed_fb_weights.view(-1, np.prod(fixed_fb_weights.shape[1:]))).view(grad_output.shape)
+
+        return res*(1-res)*grad_output, None, None, None
+
+
+class SiLUStep(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return (x >= 0).type(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        res = input * torch.sigmoid(input)
+        return (res + torch.sigmoid(input) * (1 - res)) * grad_output
+
+
 
 class SurrGradSpike(torch.autograd.Function):
     """
@@ -77,9 +110,6 @@ class SurrGradSpike(torch.autograd.Function):
 
 
 class HookFunction(torch.autograd.Function):
-    """"
-    From https://github.com/ChFrenkel/DirectRandomTargetProjection (code under Apache v2.0 license)
-    """
     @staticmethod
     def forward(ctx, input, e, fixed_fb_weights, mode):
         ctx.save_for_backward(input, e, fixed_fb_weights)
@@ -90,6 +120,7 @@ class HookFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, e, fixed_fb_weights = ctx.saved_variables
         mode = ctx.in1
+
         if mode == 'DFA':
             grad_output_est = e.mm(fixed_fb_weights.view(-1, np.prod(fixed_fb_weights.shape[1:]))).view(grad_output.shape)
         else:
@@ -102,4 +133,6 @@ trainingHook = HookFunction.apply
 
 smooth_step = SmoothStep().apply
 smooth_sigmoid = SigmoidStep().apply
+eprop_sigmoid = EpropSigmoidStep().apply
+silutstep = SiLUStep().apply
 surrgrad = SurrGradSpike().apply

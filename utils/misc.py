@@ -3,9 +3,9 @@ import numpy as np
 import os
 import time
 import torch
-
+from snn.models.SNN import BinarySNN
 from models.decoders import conv, mlp, linear
-
+# from models.encoders import gaussian_encoder
 
 
 def get_decoder(decoder_type, device, lr, **kwargs):
@@ -47,32 +47,7 @@ def get_acc(preds, labels, batch_size):
         return acc
 
 
-def get_encoder_outputs(encoding_network_output, decoding_network, encoder_outputs, tau_d):
-    if isinstance(decoding_network, conv):
-        if len(encoder_outputs) == 0:
-            return encoding_network_output.unsqueeze(0).detach()
-        else:
-            return torch.cat((encoder_outputs[:, -tau_d+1:],
-                              encoding_network_output.unsqueeze(0).detach()), dim=1)
-    elif isinstance(decoding_network, mlp) or isinstance(decoding_network, linear):
-            return torch.cat((encoder_outputs[-tau_d+1:], encoding_network_output.detach()))
-    else:
-        return torch.cat((encoder_outputs[-tau_d + 1:], encoding_network_output.detach()))
-
-
-def get_decoder_outputs(decoder, inputs, decoding, target=None):
-    if isinstance(decoder, conv):
-        return decoder(inputs)
-    if isinstance(decoder, mlp) or isinstance(decoder, linear):
-        if decoding == 'rate':
-            return decoder(torch.sum(inputs, dim=0).unsqueeze(0))
-        else:
-            return decoder(inputs.flatten().unsqueeze(0))
-    else:
-        return decoder(inputs, target)
-
-
-def get_encoded_image(iterator, loader, digits, encoding, T):
+def get_encoded_image(iterator, loader, digits, encoding, T, targets=None):
     try:
         x, label = next(iterator)
         while label not in digits:
@@ -81,7 +56,10 @@ def get_encoded_image(iterator, loader, digits, encoding, T):
         iterator = iter(loader)
         x, label = next(iterator)
 
-    target = x.flatten().unsqueeze(0)
+    if targets is not None:
+        target = targets[np.where(digits == label.numpy()[0])[0][0]].flatten().unsqueeze(0)
+    else:
+        target = x.flatten().unsqueeze(0)
 
     if encoding == 'rate':
         inputs = torch.bernoulli(x.flatten().unsqueeze(1).repeat(1, T))
@@ -97,17 +75,16 @@ def make_results_dir(exp, args):
     if args.resume:
         results_path = args.results_path
     else:
-        prelist = np.sort(fnmatch.filter(os.listdir(os.getcwd() + '/results/'), '[0-9][0-9][0-9]__*'))
+        prelist = np.sort(fnmatch.filter(os.listdir(os.getcwd() + "\\results"), '[0-9][0-9][0-9]__*'))
         if len(prelist) == 0:
             expDirN = "001"
         else:
             expDirN = "%03d" % (int((prelist[len(prelist) - 1].split("__"))[0]) + 1)
 
         results_path = time.strftime(os.getcwd() + '/results/' + expDirN + "__" + "%d-%m-%Y"
-                                     + "_" + exp + '_' + args.encoding + '_' + args.decoding + '_' + args.decoder_type + '_beta_' + str(args.beta)
+                                     + "_" + exp + '_' + args.decoder_type + '_beta_' + str(args.beta)
                                      + '_nenc_' + str(args.n_outputs_enc) + '__dt__' + str(args.dt),
                                      time.localtime())
         os.makedirs(results_path)
 
     return results_path
-

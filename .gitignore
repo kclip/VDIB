@@ -1,0 +1,5 @@
+results/
+image_reconstruction_search.py
+train_snn.py
+train_toy.py
+_old/
