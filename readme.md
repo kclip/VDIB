@@ -26,4 +26,12 @@ scipy v1.4.1
 
 neurodata (from github.com/kclip/neurodata)
 
-snn (from github.com/kclip/snn)
+snn (from github.com/kclip/snn) - up to commit 2da2eaa8626c8d361783fb3b9488181087cf6c33
+
+# Support
+The master branch contains the paper version of the code for reproducibility. 
+This version is now obsolete, please have a look at the eprop-fixed branch for an updated version, including improved performance, support of minibatching, and fixes in the
+ implementation of e-prop.
+
+
+Written by Nicolas Skatchkovsky

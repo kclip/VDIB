@@ -1,5 +1,5 @@
 import torch
-from snn.models.SNN import LayeredSNN
+from models.snn import LayeredSNN
 import numpy as np
 from utils.activations import smooth_step
 from models.LIF_base import LIFLayer
